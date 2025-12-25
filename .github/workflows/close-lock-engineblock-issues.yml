@@ -2,78 +2,146 @@ name: Close and Lock Issues with Status Stale Label
 
 on:
   schedule:
-    - cron: "0 0 * * *" # Run every day at midnight
-  workflow_dispatch: # Allows manual triggering
+    - cron: "0 0 * * *" # Run every day at midnight UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run in dry-run mode (no changes)
+        required: false
+        default: 'false'
+        type: boolean
+      batch_size:
+        description: Number of issues to process per batch
+        required: false
+        default: '50'
+        type: string
+      max_pages:
+        description: Maximum pages to fetch (0 = no limit)
+        required: false
+        default: '10'
+        type: string
+
+env:
+  LABEL_NAME: "Status%3A%20EngineBlock"
+  CUSTOM_MESSAGE: |
+    Hey there!
+
+    It looks like you are using an EngineBlock project, which we recently removed from our starters. You can read more about how we are upgrading our starters here: [Starters Upgrade: WebContainers and Vite](https://blog.stackblitz.com/posts/webcontainers-starters-update/).
+
+    Moving forward I recommend that you see if this problem persists in a WebContainer based project. You can do that by simply clicking one of the links below:
+    [node.new](https://node.new)
+    [vite.new](https://vite.new)
+    Or even more here.
+
+    For now, I am going to close this issue, but feel free to open a new one if you have any issues with the WebContainer based project.
+  LOCK_REASON: resolved
+  MAX_RETRIES: 3
+  RETRY_DELAY: 5
+  API_TIMEOUT: 30
+  BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
+  MAX_PAGES: ${{ github.event.inputs.max_pages || '10' }}
 
 jobs:
   close-issues:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Node.js
-        uses: actions/setup-node@v2
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          jq --version
+          curl --version
 
-      - name: Close and lock issues
+      - name: Validate environment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LABEL_NAME: "Status%3A%20EngineBlock"
-          CUSTOM_MESSAGE: 'Hey there! \n \n It looks like you are using an EngineBlock project, which we recently removed from our starters. You can read more about how we are upgrading our starters here: [Starters Upgrade: WebContainers and Vite](https://blog.stackblitz.com/posts/webcontainers-starters-update/).\n\nMoving forward I would recommend that you see if this problem persists in a WebContainer based project. You can do that by simply clicking one of the links below: \n [node.new](https://node.new) \n [vite.new](https://vite.new) \n Or even more here.\n\nFor now, I am going to close this issue, but feel free to open a new one if you have any issues with the WebContainer based project.'
+          BATCH_SIZE: ${{ env.BATCH_SIZE }}
+          MAX_PAGES: ${{ env.MAX_PAGES }}
         run: |
-          set -e  # Stop the script if any command fails
-          set -x  # Echo each command before executing it
+          if [ -z "${GITHUB_TOKEN}" ]; then
+            echo "Error: GITHUB_TOKEN secret is required"
+            exit 1
+          fi
 
-          page=1
-          while : ; do
-            echo "Fetching page $page of issues..."
-            response=$(curl -sS -H "Authorization: token $GITHUB_TOKEN" \
-                 -H "Accept: application/vnd.github.v3+json" \
-                 "https://api.github.com/repos/$GITHUB_REPOSITORY/issues?state=open&labels=$LABEL_NAME&per_page=1&page=$page")
+          if ! [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]]; then
+            echo "Error: batch_size must be a positive integer"
+            exit 1
+          fi
 
-            echo $response > issues.json
+          if [ "$BATCH_SIZE" -eq 0 ]; then
+            echo "Error: batch_size must be at least 1"
+            exit 1
+          fi
 
-            if [ $(jq length issues.json) -eq 0 ]; then
-              echo "No more issues found."
-              break
-            fi
+          if ! [[ "$MAX_PAGES" =~ ^[0-9]+$ ]]; then
+            echo "Error: max_pages must be a non-negative integer"
+            exit 1
+          fi
 
-            echo "Commenting, closing, and locking issues..."
-            jq -c '.[] | .number' issues.json | while read -r issue; do
-              # Comment on the issue
-              COMMENT_RESPONSE=$(curl -sS -w "%{http_code}" -X POST -H "Authorization: token $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$issue/comments" \
-                    -d "{\"body\": \"$CUSTOM_MESSAGE\"}")
+          echo "Environment validation passed"
+          echo "Processing batch size: $BATCH_SIZE"
+          echo "Max pages: $MAX_PAGES"
 
-              HTTP_STATUS=$(echo $COMMENT_RESPONSE | rev | cut -c 1-3 | rev)
-              RESPONSE_BODY=$(echo $COMMENT_RESPONSE | rev | cut -c 4- | rev)
+      - name: Close and lock issues
+        id: process_issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LABEL_NAME: ${{ env.LABEL_NAME }}
+          CUSTOM_MESSAGE: ${{ env.CUSTOM_MESSAGE }}
+          LOCK_REASON: ${{ env.LOCK_REASON }}
+          BATCH_SIZE: ${{ env.BATCH_SIZE }}
+          MAX_RETRIES: ${{ env.MAX_RETRIES }}
+          RETRY_DELAY: ${{ env.RETRY_DELAY }}
+          API_TIMEOUT: ${{ env.API_TIMEOUT }}
+          MAX_PAGES: ${{ env.MAX_PAGES }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          chmod +x ./scripts/github-helpers.sh
+          source ./scripts/github-helpers.sh
 
-              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-                echo "Successfully commented on issue $issue."
-              else
-                echo "Failed to comment on issue $issue. HTTP Status: $HTTP_STATUS, Response: $RESPONSE_BODY"
-                exit 1
-              fi
+          echo "Starting issue processing for $GITHUB_REPOSITORY"
+          echo "Label: $LABEL_NAME"
+          echo "Dry run: $DRY_RUN"
 
-              # Close and lock the issue
-              RESPONSE=$(curl -sS -w "%{http_code}" -X PATCH -H "Authorization: token $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$issue" \
-                    -d "{\"state\": \"closed\", \"lock_reason\": \"resolved\"}")
+          process_issues_in_batches "$LABEL_NAME" "$BATCH_SIZE" "$DRY_RUN"
 
-              HTTP_STATUS=$(echo $RESPONSE | rev | cut -c 1-3 | rev)
-              RESPONSE_BODY=$(echo $RESPONSE | rev | cut -c 4- | rev)
+      - name: Generate summary report
+        if: always()
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          echo "## Issue Processing Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Execution Time: $(date -u)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Actor: $GITHUB_ACTOR" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dry Run: $DRY_RUN" >> "$GITHUB_STEP_SUMMARY"
 
-              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-                echo "Successfully closed and locked issue $issue."
-              else
-                echo "Failed to close and lock issue $issue. HTTP Status: $HTTP_STATUS, Response: $RESPONSE_BODY"
-                exit 1
-              fi
-            done
-          done
+          if [ -f processing-stats.json ]; then
+            echo "- Processing Stats:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat processing-stats.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  notify-failure:
+    needs: close-issues
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify failure
+        run: |
+          echo "Issue processing failed. Review logs for details."
